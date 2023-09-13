@@ -2,8 +2,12 @@
 
 from typing import Optional, Tuple, Union
 
+import time
+import redis
 import torch
+import numpy as np
 import torch.utils.checkpoint
+from functools import partial
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import transformers
@@ -736,3 +740,141 @@ class MossForCausalLM(MossPreTrainedModel):
         from .quantization import quantize_with_gptq
         return quantize_with_gptq(self, wbits, groupsize)
 
+
+class WrapCausalLM(MossForCausalLM):
+    _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.causal_mask"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.conn = redis.Redis(host='localhost', port=6379, db=0)
+        self.transformer.wte.register_forward_hook(partial(self.conn))
+
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    @add_start_docstrings_to_model_forward(MOSS_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=CausalLMOutputWithPast,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
+            `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
+            are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.transformer(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = transformer_outputs[0]
+        lora_states = get_lora_state(self.conn, retry_time=5)
+        if lora_states is not None:
+            hidden_states = hidden_states + lora_states.to(hidden_states.device)
+        lm_logits = self.lm_head(hidden_states).to(torch.float32)
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+            loss = loss.to(hidden_states.dtype)
+
+        if not return_dict:
+            output = (lm_logits,) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+    @staticmethod
+    def _reorder_cache(
+        past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+    ) -> Tuple[Tuple[torch.Tensor]]:
+        """
+        This function is used to re-order the `past_key_values` cache if [`~PretrainedModel.beam_search`] or
+        [`~PretrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
+        beam_idx at every generation step.
+        """
+        return tuple(
+            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
+            for layer_past in past_key_values
+        )
+
+
+def get_lora_state(conn, retry_time=5):
+    shape_key = 'lora_shape'
+    val_key = 'lora_data'
+    return get_tensor_data(conn, shape_key, val_key, retry_time)
+
+
+def get_tensor_data(conn, s_key, d_key, retry_time=5):
+    t_data = None
+    shape_val = None
+    for _ in range(retry_time):
+        if t_data is None:
+            t_data = conn.getdel(d_key)
+        if shape_val is None:
+            shape_val = conn.getdel(s_key)
+        if t_data is not None and shape_val is not None:
+            shape = tuple(np.frombuffer(shape_val, dtype=np.int64))
+            res_tensor = torch.Tensor(np.frombuffer(t_data, dtype=np.float16).copy())
+            res_tensor = res_tensor.reshape(shape)
+            return res_tensor
+        time.sleep(0.002)
+    return None
+
+
+def set_tensor_data(conn, s_key, shape, d_key, _data):
+    _shape = np.array(shape, dtype=np.int64).tobytes()
+    _arr = _data.cpu().numpy()
+    serialized_array = _arr.tobytes()
+    conn.set(s_key, _shape)
+    conn.set(d_key, serialized_array)
+
+
+def emb_hook(conn,  module, input_tensor, output_tensor):
+    s_key = 'emb_shape'
+    d_key = 'emb_data'
+    shape = output_tensor.shape
+    set_tensor_data(conn, s_key, shape, d_key, output_tensor)
