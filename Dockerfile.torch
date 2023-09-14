@@ -17,4 +17,5 @@ ADD doc_req.txt .
 RUN pip install -r doc_req.txt
 RUN apt-get update && apt-get install -y redis-server
 RUN pip install redis 
+RUN pip install nvidia-tensorflow[horovod]
 
