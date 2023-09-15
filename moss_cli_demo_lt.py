@@ -2,6 +2,7 @@ import argparse
 import os
 import platform
 import warnings
+import numpy as np
 
 import torch
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
@@ -46,6 +47,7 @@ if num_gpus > 1:
     )
 else: # on a single gpu
     model = WrapCausalLM.from_pretrained(model_path).half().cuda()
+    model.set_lora_dtype(np.float32)
 
 
 def clear():

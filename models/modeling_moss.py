@@ -748,7 +748,10 @@ class WrapCausalLM(MossForCausalLM):
         super().__init__(config)
         self.conn = redis.Redis(host='localhost', port=6379, db=0)
         self.transformer.wte.register_forward_hook(partial(emb_hook, self.conn))
+        self.lora_dtype=np.float32
 
+    def set_lora_dtype(self, dtype):
+        self.lora_dtype = dtype
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -799,7 +802,7 @@ class WrapCausalLM(MossForCausalLM):
             return_dict=return_dict,
         )
         hidden_states = transformer_outputs[0]
-        lora_states = get_lora_state(self.conn, retry_time=5)
+        lora_states = get_lora_state(self.conn, self.lora_dtype, retry_time=5)
         if lora_states is not None:
             hidden_states = hidden_states + lora_states.to(hidden_states.device).to(torch.float16)
         lm_logits = self.lm_head(hidden_states).to(torch.float32)
@@ -842,13 +845,13 @@ class WrapCausalLM(MossForCausalLM):
         )
 
 
-def get_lora_state(conn, retry_time=5):
+def get_lora_state(conn, dtype=np.float32, retry_time=5):
     shape_key = 'lora_shape'
     val_key = 'lora_data'
-    return get_tensor_data(conn, shape_key, val_key, retry_time)
+    return get_tensor_data(conn, shape_key, val_key, dtype, retry_time)
 
 
-def get_tensor_data(conn, s_key, d_key, retry_time=5):
+def get_tensor_data(conn, s_key, d_key, dtype, retry_time=5):
     t_data = None
     shape_val = None
     for _ in range(retry_time):
@@ -860,7 +863,7 @@ def get_tensor_data(conn, s_key, d_key, retry_time=5):
             conn.delete(s_key)
         if t_data is not None and shape_val is not None:
             shape = tuple(np.frombuffer(shape_val, dtype=np.int64))
-            res_tensor = torch.Tensor(np.frombuffer(t_data, dtype=np.float32).copy())
+            res_tensor = torch.Tensor(np.frombuffer(t_data, dtype=dtype).copy())
             res_tensor = res_tensor.reshape(shape)
             return res_tensor
         time.sleep(0.002)
