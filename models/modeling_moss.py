@@ -801,7 +801,8 @@ class WrapCausalLM(MossForCausalLM):
         hidden_states = transformer_outputs[0]
         lora_states = get_lora_state(self.conn, retry_time=5)
         if lora_states is not None:
-            hidden_states = hidden_states + lora_states.to(hidden_states.device).to(torch.float16)
+            if lora_states.shape == hidden_sates.shape:
+                hidden_states = hidden_states + lora_states.to(hidden_states.device).to(torch.float16)
         lm_logits = self.lm_head(hidden_states).to(torch.float32)
 
         loss = None

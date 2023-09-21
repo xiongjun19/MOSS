@@ -13,9 +13,9 @@ from models.modeling_moss import MossForCausalLM
 from models.tokenization_moss import MossTokenizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--model_name", default="fnlp/moss-moon-003-sft-int4", 
-                    choices=["fnlp/moss-moon-003-sft", 
-                             "fnlp/moss-moon-003-sft-int8", 
+parser.add_argument("--model_name", default="fnlp/moss-moon-003-sft-int4",
+                    choices=["fnlp/moss-moon-003-sft",
+                             "fnlp/moss-moon-003-sft-int8",
                              "fnlp/moss-moon-003-sft-int4"], type=str)
 parser.add_argument("--gpu", default="0", type=str)
 args = parser.parse_args()
@@ -35,7 +35,7 @@ if not os.path.exists(args.model_name):
 
 config = MossConfig.from_pretrained(model_path)
 tokenizer = MossTokenizer.from_pretrained(model_path)
-if num_gpus > 1:  
+if num_gpus > 1:
     print("Waiting for all devices to be ready, it may take a few minutes...")
     with init_empty_weights():
         raw_model = MossForCausalLM._from_config(config, torch_dtype=torch.float16)
@@ -49,7 +49,7 @@ else: # on a single gpu
 
 def clear():
     os.system('cls' if platform.system() == 'Windows' else 'clear')
-    
+
 def main():
     meta_instruction = \
     """You are an AI assistant whose name is MOSS.
