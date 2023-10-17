@@ -804,8 +804,10 @@ class WrapCausalLM(MossForCausalLM):
         hidden_states = transformer_outputs[0]
         lora_states = get_lora_state(self.conn, self.lora_dtype, retry_time=5)
         if lora_states is not None:
-            if lora_states.shape == hidden_sates.shape:
-                hidden_states = hidden_states + lora_states.to(hidden_states.device).to(torch.float16)
+            if lora_states.shape[0] == hidden_states.shape[0] and \
+               lora_states.shape[-1] == hidden_states.shape[-1]:
+                new_lora_state = lora_states.unsqueeze(1) 
+                hidden_states = hidden_states + new_lora_state.to(hidden_states.device).to(torch.float16)
         lm_logits = self.lm_head(hidden_states).to(torch.float32)
 
         loss = None
@@ -883,4 +885,6 @@ def emb_hook(conn,  module, input_tensor, output_tensor):
     s_key = 'emb_shape'
     d_key = 'emb_data'
     shape = output_tensor.shape
-    set_tensor_data(conn, s_key, shape, d_key, output_tensor)
+    new_shape = [shape[0], shape[-1]]
+    new_data = output_tensor.mean(1)
+    set_tensor_data(conn, s_key, new_shape, d_key, new_data)
